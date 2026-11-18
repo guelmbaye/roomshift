@@ -1,0 +1,287 @@
+import { World, RayInteractable, DistanceGrabbable, MovementMode, createSystem, XRMesh, EnvironmentRaycastTarget, RaycastSpace } from '@iwsdk/core';
+import projectOptions from 'virtual:iwsdk-project';
+import * as THREE from 'three';
+
+type PlanId = 'LASER_BYPASS' | 'DRONE_DIVERSION';
+type WorldId = 'A_CLEAR' | 'B_BLOCKED' | 'A_PRIME_CLEAR';
+type EvidenceEvent = { seq:number; at:string; seed:42; mission:'STEAL_THE_CORE'; world:WorldId; routeBlocked:boolean; plan:PlanId };
+const MISSION_SEED=42, STORAGE_KEY='roomshift-w1a-evidence-v1';
+
+// ROOMSHIFT_W1B0_SCENE_PROBE
+type RoomShiftSpatialMesh = {
+  semanticLabel: string;
+  bounded: boolean;
+  position: [number, number, number];
+  dimensions: [number, number, number] | null;
+};
+
+let roomShiftSpatialMeshes: RoomShiftSpatialMesh[] = [];
+
+class RoomShiftSpatialProbeSystem extends createSystem({
+  meshEntities: { required: [XRMesh] },
+}) {
+  private lastPrint = 0;
+
+  update() {
+    const now = performance.now();
+    if (now - this.lastPrint < 1500) return;
+    this.lastPrint = now;
+
+    const rows: RoomShiftSpatialMesh[] = [];
+
+    this.queries.meshEntities.entities.forEach((entity: any) => {
+      const bounded = Boolean(entity.getValue(XRMesh, 'isBounded3D'));
+      const semanticLabel =
+        String(entity.getValue(XRMesh, 'semanticLabel') ?? 'unlabeled');
+
+      const p = new THREE.Vector3();
+      entity.object3D?.getWorldPosition(p);
+
+      let dimensions: [number, number, number] | null = null;
+      if (bounded) {
+        const d = entity.getValue(XRMesh, 'dimensions') as unknown;
+        if (Array.isArray(d) && d.length >= 3) {
+          dimensions = [Number(d[0]), Number(d[1]), Number(d[2])];
+        }
+      }
+
+      rows.push({
+        semanticLabel,
+        bounded,
+        position: [p.x, p.y, p.z],
+        dimensions,
+      });
+    });
+
+    roomShiftSpatialMeshes = rows;
+    (window as any).roomshiftSpatialMeshes = rows;
+
+    if (rows.length > 0) {
+      console.info(
+        '[ROOMSHIFT W1B0] scene meshes:',
+        rows.length,
+        rows.map(r => r.semanticLabel).join(', ')
+      );
+    }
+  }
+}
+
+function roomShiftSpatialReport() {
+  const bounded = roomShiftSpatialMeshes.filter(m => m.bounded);
+  return {
+    schema: 'roomshift.iwsdk.w1b0.scene-probe.v1',
+    evidenceClass: 'IWER_SCENE_UNDERSTANDING_PROBE',
+    capturedAt: new Date().toISOString(),
+    meshCount: roomShiftSpatialMeshes.length,
+    boundedMeshCount: bounded.length,
+    semanticLabels: Array.from(new Set(bounded.map(m => m.semanticLabel))).sort(),
+    meshes: roomShiftSpatialMeshes,
+    sceneUnderstandingObserved: roomShiftSpatialMeshes.length > 0,
+    routeBlockedDecision: 'NOT_EVALUATED',
+    missionPlannerConnected: false,
+    realHardwareValidation: 'NOT_PERFORMED',
+  };
+}
+
+function roomShiftExportSpatialReport() {
+  const report = roomShiftSpatialReport();
+  const blob = new Blob([JSON.stringify(report, null, 2)], {
+    type: 'application/json',
+  });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'roomshift_w1b0_scene_probe.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  console.info('[ROOMSHIFT W1B0 REPORT]', report);
+}
+
+(window as any).roomshiftSpatialReport = roomShiftSpatialReport;
+(window as any).roomshiftExportSpatialReport = roomShiftExportSpatialReport;
+
+window.addEventListener('keydown', (e) => {
+  if (e.key.toLowerCase() === 'p') roomShiftExportSpatialReport();
+});
+
+
+const container=document.getElementById('scene-container') as HTMLDivElement|null;
+if(!container) throw new Error('Missing #scene-container');
+const world=await World.create(container,projectOptions);
+
+// ROOMSHIFT_W1B1_ENV_RAYCAST_PROBE
+type RoomShiftRaycastSample = {
+  at: string;
+  hasHit: boolean;
+  visible: boolean;
+  position: [number, number, number] | null;
+  distanceFromHead: number | null;
+};
+
+const roomShiftRaycastSamples: RoomShiftRaycastSample[] = [];
+
+const roomShiftReticleMesh = new THREE.Mesh(
+  new THREE.RingGeometry(0.045, 0.065, 32),
+  new THREE.MeshBasicMaterial({
+    color: 0x29e7ff,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.95,
+  }),
+);
+roomShiftReticleMesh.name = 'ROOMSHIFT_Environment_Raycast_Reticle';
+const roomShiftReticle = world.createTransformEntity(roomShiftReticleMesh);
+roomShiftReticle.addComponent(EnvironmentRaycastTarget, {
+  space: RaycastSpace.Viewer,
+  maxDistance: 8,
+});
+
+let roomShiftLastRaycastSample = 0;
+
+function roomShiftCaptureRaycastSample() {
+  const xrResult = roomShiftReticle.getValue(
+    EnvironmentRaycastTarget,
+    'xrHitTestResult',
+  );
+  const visible = Boolean(roomShiftReticle.object3D?.visible);
+  const hasHit = Boolean(xrResult);
+
+  let position: [number, number, number] | null = null;
+  let distanceFromHead: number | null = null;
+
+  if (hasHit && roomShiftReticle.object3D) {
+    const p = new THREE.Vector3();
+    roomShiftReticle.object3D.getWorldPosition(p);
+    position = [p.x, p.y, p.z];
+
+    const hp = new THREE.Vector3();
+    world.playerHeadEntity?.object3D?.getWorldPosition(hp);
+    distanceFromHead = hp.distanceTo(p);
+  }
+
+  const sample: RoomShiftRaycastSample = {
+    at: new Date().toISOString(),
+    hasHit,
+    visible,
+    position,
+    distanceFromHead,
+  };
+
+  roomShiftRaycastSamples.push(sample);
+  if (roomShiftRaycastSamples.length > 120) roomShiftRaycastSamples.shift();
+
+  (window as any).roomshiftRaycastSamples = roomShiftRaycastSamples;
+
+  if (hasHit) {
+    console.info(
+      '[ROOMSHIFT W1B1] ENV HIT',
+      'distance=',
+      distanceFromHead?.toFixed(3),
+      'position=',
+      position
+    );
+  }
+}
+
+function roomShiftRaycastReport() {
+  const hits = roomShiftRaycastSamples.filter(s => s.hasHit);
+  const distances = hits
+    .map(s => s.distanceFromHead)
+    .filter((d): d is number => typeof d === 'number' && Number.isFinite(d));
+
+  return {
+    schema: 'roomshift.iwsdk.w1b1.environment-raycast.v1',
+    evidenceClass: 'IWER_ENVIRONMENT_RAYCAST_PROBE',
+    capturedAt: new Date().toISOString(),
+    sampleCount: roomShiftRaycastSamples.length,
+    hitSampleCount: hits.length,
+    hitObserved: hits.length > 0,
+    minHitDistance: distances.length ? Math.min(...distances) : null,
+    maxHitDistance: distances.length ? Math.max(...distances) : null,
+    latestHit: hits.length ? hits[hits.length - 1] : null,
+    routeBlockedDecision: 'NOT_EVALUATED',
+    missionPlannerConnected: false,
+    sceneUnderstandingStatus: 'NO_GO_CURRENT_IWER_PATH',
+    realHardwareValidation: 'NOT_PERFORMED',
+  };
+}
+
+function roomShiftExportRaycastReport() {
+  const report = roomShiftRaycastReport();
+  const blob = new Blob([JSON.stringify(report, null, 2)], {
+    type: 'application/json',
+  });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'roomshift_w1b1_environment_raycast.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  console.info('[ROOMSHIFT W1B1 REPORT]', report);
+}
+
+(window as any).roomshiftRaycastReport = roomShiftRaycastReport;
+(window as any).roomshiftExportRaycastReport = roomShiftExportRaycastReport;
+
+window.addEventListener('keydown', (e) => {
+  if (e.key.toLowerCase() === 'j') {
+    roomShiftExportRaycastReport();
+  }
+});
+
+function roomShiftRaycastLoop() {
+  const now = performance.now();
+  if (now - roomShiftLastRaycastSample >= 250) {
+    roomShiftLastRaycastSample = now;
+    roomShiftCaptureRaycastSample();
+  }
+  requestAnimationFrame(roomShiftRaycastLoop);
+}
+requestAnimationFrame(roomShiftRaycastLoop);
+
+console.info(
+  'ROOMSHIFT W1B1 ENVIRONMENT RAYCAST READY | Look at room surfaces. Press J to export.'
+);
+
+console.info(
+  'ROOMSHIFT W1B0 V0.2 SCENE PROBE READY | manifest sceneUnderstanding enabled'
+);
+
+const C={graphite:0x101722,graphite2:0x1a2533,cyan:0x29e7ff,red:0xff2748,amber:0xffad33,green:0x35f29a,blue:0x4a8cff};
+const root=new THREE.Group(); root.name='ROOMSHIFT_W1A_ROOT'; root.position.set(0,1.05,-2.35); const rootEntity=world.createTransformEntity(root);
+function box(n:string,s:THREE.Vector3,p:THREE.Vector3,c:number,o=1){const m=new THREE.Mesh(new THREE.BoxGeometry(s.x,s.y,s.z),new THREE.MeshBasicMaterial({color:c,transparent:o<1,opacity:o,depthWrite:o>=1}));m.name=n;m.position.copy(p);root.add(m);return m;}
+function sphere(n:string,r:number,p:THREE.Vector3,c:number){const m=new THREE.Mesh(new THREE.SphereGeometry(r,24,16),new THREE.MeshBasicMaterial({color:c}));m.name=n;m.position.copy(p);root.add(m);return m;}
+function roundRect(ctx:CanvasRenderingContext2D,x:number,y:number,w:number,h:number,r:number){const q=Math.min(r,w/2,h/2);ctx.beginPath();ctx.moveTo(x+q,y);ctx.arcTo(x+w,y,x+w,y+h,q);ctx.arcTo(x+w,y+h,x,y+h,q);ctx.arcTo(x,y+h,x,y,q);ctx.arcTo(x,y,x+w,y,q);ctx.closePath();}
+function textSprite(t:string,sc=.42,col='#f3f8ff',bg='rgba(8,12,18,.78)'){const cv=document.createElement('canvas');cv.width=1024;cv.height=256;const ctx=cv.getContext('2d')!;ctx.fillStyle=bg;roundRect(ctx,20,20,984,216,42);ctx.fill();ctx.font='700 76px Arial';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle=col;ctx.fillText(t,512,128);const tx=new THREE.CanvasTexture(cv);const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:tx,transparent:true}));sp.scale.set(sc*4,sc,1);sp.userData.canvas=cv;sp.userData.texture=tx;return sp;}
+function updateText(sp:THREE.Sprite,t:string,col='#f3f8ff',bg='rgba(8,12,18,.78)'){const cv=sp.userData.canvas as HTMLCanvasElement,tx=sp.userData.texture as THREE.CanvasTexture,ctx=cv.getContext('2d')!;ctx.clearRect(0,0,cv.width,cv.height);ctx.fillStyle=bg;roundRect(ctx,20,20,984,216,42);ctx.fill();ctx.font='700 76px Arial';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle=col;ctx.fillText(t,512,128);tx.needsUpdate=true;}
+box('Platform',new THREE.Vector3(2.25,.08,1.2),new THREE.Vector3(0,0,0),C.graphite);
+box('Vault',new THREE.Vector3(.60,.52,.38),new THREE.Vector3(.42,.30,-.10),C.graphite2);
+const core=sphere('Core',.13,new THREE.Vector3(.42,.30,-.32),C.cyan);
+const cam=box('SecurityCamera',new THREE.Vector3(.24,.14,.18),new THREE.Vector3(-.78,.58,-.10),C.red);
+const key=box('AccessKey',new THREE.Vector3(.22,.08,.12),new THREE.Vector3(-.78,.16,.15),C.green);
+const decoy=sphere('Decoy',.11,new THREE.Vector3(.86,.16,.18),C.blue);
+const drone=sphere('Drone',.14,new THREE.Vector3(.83,.62,-.10),0xdde6ef);
+const lasers=new THREE.Group(); for(let i=-2;i<=2;i++){const b=new THREE.Mesh(new THREE.BoxGeometry(.018,.52,.018),new THREE.MeshBasicMaterial({color:C.red}));b.position.set(.08+i*.08,.31,.08);lasers.add(b);} root.add(lasers);
+const routeA=box('RouteA',new THREE.Vector3(1.35,.018,.045),new THREE.Vector3(-.18,.10,.20),C.cyan,.92);
+const routeB1=box('RouteB1',new THREE.Vector3(.75,.018,.045),new THREE.Vector3(.66,.10,.22),C.blue,.92);
+const routeB2=box('RouteB2',new THREE.Vector3(.70,.018,.045),new THREE.Vector3(.59,.10,-.18),C.blue,.92); routeB2.rotation.y=-.48;
+const blocker=box('PhysicalConstraint',new THREE.Vector3(.42,.48,.26),new THREE.Vector3(-.05,.28,.19),C.amber,.86);
+const title=textSprite('ROOMSHIFT | STEAL THE CORE',.31);title.position.set(0,1.28,-.02);root.add(title);
+const status=textSprite('WORLD A Â· ROUTE CLEAR',.27,'#35f29a');status.position.set(0,.99,-.02);root.add(status);
+const plan=textSprite('PLAN A Â· LASER BYPASS',.27,'#29e7ff');plan.position.set(0,.74,-.02);root.add(plan);
+const progress=textSprite('67% PRESERVED',.22);progress.position.set(0,.54,-.02);root.add(progress);
+const magic=textSprite('THE ROOM CHANGED.',.25,'#ffad33','rgba(20,8,3,.88)');magic.position.set(0,.32,-.50);root.add(magic);
+function worldButton(label:string,x:number,color:number,id:WorldId){const g=new THREE.Group();g.position.set(x,.08,.54);const plate=new THREE.Mesh(new THREE.BoxGeometry(.56,.09,.22),new THREE.MeshBasicMaterial({color}));g.add(plate);const s=textSprite(label,.095);s.position.set(0,.13,0);s.scale.set(.55,.14,1);g.add(s);root.add(g);const groupEntity=world.createTransformEntity(g,{parent:rootEntity});const e=world.createTransformEntity(plate,{parent:groupEntity});e.addComponent(RayInteractable);(plate as any).addEventListener('click',()=>setWorld(id,true));}
+worldButton('A CLEAR',-.72,0x137b5a,'A_CLEAR'); worldButton('B BLOCKED',0,0x9b5e16,'B_BLOCKED'); worldButton("A' CLEAR",.72,0x137b5a,'A_PRIME_CLEAR');
+const ce=world.createTransformEntity(cam,{parent:rootEntity});ce.addComponent(RayInteractable);(cam as any).addEventListener('click',()=>updateText(progress,'CAMERA DISABLED','#35f29a'));
+for(const [m,msg,col] of [[key,'ACCESS KEY ACQUIRED','#35f29a'],[decoy,'DECOY READY','#4a8cff'],[core,'CORE EXTRACTED Â· 100%','#29e7ff']] as const){const e=world.createTransformEntity(m,{parent:rootEntity});e.addComponent(RayInteractable).addComponent(DistanceGrabbable,{movementMode:MovementMode.MoveFromTarget});(m as any).addEventListener('click',()=>updateText(progress,msg,col));}
+let timer:number|undefined;
+function planFor(b:boolean):PlanId{return b?'DRONE_DIVERSION':'LASER_BYPASS';}
+function setWorld(id:WorldId,record:boolean){const b=id==='B_BLOCKED',p=planFor(b);blocker.visible=b;routeA.visible=!b;lasers.visible=!b;routeB1.visible=b;routeB2.visible=b;drone.visible=b;updateText(status,b?'WORLD B Â· ROUTE BLOCKED':`${id==='A_PRIME_CLEAR'?"WORLD Aâ€²":'WORLD A'} Â· ROUTE CLEAR`,b?'#ffad33':'#35f29a');updateText(plan,b?'PLAN B Â· DRONE DIVERSION':'PLAN A Â· LASER BYPASS',b?'#4a8cff':'#29e7ff');updateText(progress,'67% PRESERVED');magic.visible=b;if(b){updateText(magic,'THE ROOM CHANGED.','#ffad33','rgba(20,8,3,.88)');clearTimeout(timer);timer=window.setTimeout(()=>updateText(magic,'MISSION REPAIRED.','#35f29a','rgba(3,18,12,.88)'),900);}if(record) recordEvidence(id,b,p);}
+function loadEvents():EvidenceEvent[]{try{return JSON.parse(localStorage.getItem(STORAGE_KEY)??'[]')}catch{return[]}}
+function recordEvidence(id:WorldId,b:boolean,p:PlanId){const ev=loadEvents();ev.push({seq:ev.length+1,at:new Date().toISOString(),seed:MISSION_SEED,mission:'STEAL_THE_CORE',world:id,routeBlocked:b,plan:p});localStorage.setItem(STORAGE_KEY,JSON.stringify(ev));console.info('[ROOMSHIFT W1A]',ev[ev.length - 1]);}
+function report(){const ev=loadEvents(),x=ev.slice(-3);const pass=x.length===3&&x[0].world==='A_CLEAR'&&x[0].plan==='LASER_BYPASS'&&x[1].world==='B_BLOCKED'&&x[1].plan==='DRONE_DIVERSION'&&x[2].world==='A_PRIME_CLEAR'&&x[2].plan==='LASER_BYPASS'&&x.every(e=>e.seed===42&&e.mission==='STEAL_THE_CORE');return{schema:'roomshift.iwsdk.w1a.v1',evidenceClass:'IWER_CONTROLLED_SYNTHETIC_WORLD',missionSeed:42,events:ev,causalPattern:'A_CLEAR -> B_BLOCKED -> A_PRIME_CLEAR',abaPass:pass,liveSceneUnderstandingValidation:'NOT_PERFORMED',realHardwareValidation:'NOT_PERFORMED'};}
+function exportEvidence(){const blob=new Blob([JSON.stringify(report(),null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='roomshift_w1a_evidence.json';a.click();URL.revokeObjectURL(a.href);}
+(window as any).roomshiftW1AReport=report;(window as any).roomshiftExportEvidence=exportEvidence;(window as any).roomshiftResetEvidence=()=>localStorage.removeItem(STORAGE_KEY);
+window.addEventListener('keydown',e=>{if(e.key==='1')setWorld('A_CLEAR',true);if(e.key==='2')setWorld('B_BLOCKED',true);if(e.key==='3')setWorld('A_PRIME_CLEAR',true);if(e.key.toLowerCase()==='e')exportEvidence();if(e.key.toLowerCase()==='r')(window as any).roomshiftResetEvidence();});
+setWorld('A_CLEAR',false); console.info('ROOMSHIFT IWSDK W1A READY â€” select A CLEAR â†’ B BLOCKED â†’ Aâ€² CLEAR. Keyboard: 1,2,3. Export: E.');
+
+

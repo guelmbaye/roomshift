@@ -1,0 +1,240 @@
+import {
+  Hovered,
+  Pressed,
+  RayInteractable,
+  createSystem,
+  type World,
+} from '@iwsdk/core';
+import * as THREE from 'three';
+
+type PresentationSource = {
+  getDecision: () => string;
+  getPlan: () => string;
+};
+
+let source: PresentationSource | null = null;
+
+const targetNames: Record<string, string> = {
+  SECURITY_CAMERA: 'SECURITY CAMERA',
+  ACCESS_KEY: 'ACCESS KEY',
+  DECOY: 'DRONE DIVERSION',
+  CORE: 'CORE',
+};
+
+function normalizeTarget(entity: any): string | null {
+  const raw =
+    entity?.object3D?.userData?.roomshiftTargetId ||
+    entity?.object3D?.userData?.targetId ||
+    entity?.object3D?.name ||
+    entity?.name ||
+    '';
+  const v = String(raw).trim().toUpperCase();
+  if (v.includes('SECURITY') || v.includes('CAMERA')) return 'SECURITY_CAMERA';
+  if (v.includes('ACCESS') || v.includes('KEY')) return 'ACCESS_KEY';
+  if (v.includes('DECOY') || v.includes('DRONE')) return 'DECOY';
+  if (v.includes('CORE')) return 'CORE';
+  return null;
+}
+
+function accent(id: string): string {
+  if (id === 'SECURITY_CAMERA') return '#ff385c';
+  if (id === 'ACCESS_KEY') return '#00e5ff';
+  if (id === 'DECOY') return '#ffb020';
+  return '#7c5cff';
+}
+
+function makeGlow(color: string): THREE.Sprite {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256; canvas.height = 256;
+  const ctx = canvas.getContext('2d')!;
+  const g = ctx.createRadialGradient(128,128,10,128,128,124);
+  g.addColorStop(0, color + 'dd');
+  g.addColorStop(.32, color + '55');
+  g.addColorStop(1, color + '00');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,256,256);
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: .28, depthWrite:false, depthTest:false });
+  const s = new THREE.Sprite(mat);
+  s.scale.set(.34,.34,1);
+  s.renderOrder = 998;
+  return s;
+}
+
+function makeLabel(text: string, color: string): THREE.Sprite {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512; canvas.height = 128;
+  const ctx = canvas.getContext('2d')!;
+  ctx.fillStyle = 'rgba(5,12,18,.86)';
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.roundRect(8,8,496,112,24);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.font = '700 42px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text,256,64);
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent:true, depthWrite:false, depthTest:false });
+  const s = new THREE.Sprite(mat);
+  s.scale.set(.42,.105,1);
+  s.position.set(0,.18,0);
+  s.renderOrder = 999;
+  return s;
+}
+
+function presentationMode(): boolean {
+  const q = new URLSearchParams(location.search);
+  return q.get('presentation') === '1' || q.get('judge') === '1';
+}
+
+function hideEngineeringPanels() {
+  const patterns = [
+    'HANDS FIRST',
+    'AUTO SPATIAL',
+    'ROOMSHIFT W2C.1',
+    'HELD-OUT WORLDS',
+    'SPATIAL STABILITY',
+  ];
+  for (const el of Array.from(document.querySelectorAll<HTMLElement>('div'))) {
+    const txt = (el.innerText || '').toUpperCase();
+    if (!txt || !patterns.some(p => txt.includes(p))) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 540 && r.height < 440) el.style.display = 'none';
+  }
+}
+
+function buildHud(): HTMLElement {
+  const root = document.createElement('div');
+  root.id = 'roomshift-w3a-judge-hud';
+  root.innerHTML = `
+  <style>
+    #roomshift-w3a-judge-hud{position:fixed;inset:0;z-index:2147483000;pointer-events:none;font-family:Inter,system-ui,sans-serif;color:#fff}
+    .rs-card{position:absolute;padding:12px 16px;border-radius:14px;background:rgba(4,10,16,.74);border:1px solid rgba(255,255,255,.15);backdrop-filter:blur(10px)}
+    .rs-brand{left:24px;top:22px}.rs-route{right:24px;top:22px;min-width:260px}
+    .rs-brand b{font-size:18px;letter-spacing:.12em}.rs-brand small,.rs-route small{display:block;color:#aeb8c4;letter-spacing:.09em}
+    #rs-decision{margin-top:4px;font-size:24px;font-weight:850}.rs-plan{margin-top:3px;font-size:14px;color:#d7e1ea}
+    .rs-tag{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);padding:10px 17px;border-radius:999px;background:rgba(4,10,16,.68);border:1px solid rgba(255,255,255,.14);font-size:13px;font-weight:800;letter-spacing:.14em}
+    .rs-toast{position:absolute;left:50%;top:34%;transform:translate(-50%,-50%) scale(.94);opacity:0;min-width:380px;text-align:center;padding:18px 28px;border-radius:18px;background:rgba(4,10,16,.9);border:2px solid #ffb020;transition:.18s}
+    .rs-toast.show{opacity:1;transform:translate(-50%,-50%) scale(1)} .rs-toast b{font-size:28px;letter-spacing:.06em}.rs-toast small{display:block;margin-top:5px;color:#ccd6df;font-size:14px}
+  </style>
+  <div class="rs-card rs-brand"><b>ROOMSHIFT</b><small>STEAL THE CORE</small></div>
+  <div class="rs-card rs-route"><small>ROOM SCAN</small><div id="rs-decision">ANALYZING…</div><div class="rs-plan" id="rs-plan">Spatial route pending</div></div>
+  <div class="rs-toast" id="rs-toast"><b id="rs-toast-big">ROOM CHANGED</b><small id="rs-toast-small">Replanning mission</small></div>
+  <div class="rs-tag">YOUR ROOM IS THE LEVEL</div>`;
+  document.body.appendChild(root);
+  return root;
+}
+
+function makeAudio() {
+  let ctx: AudioContext | null = null;
+  const ensure = () => {
+    if (!ctx) ctx = new AudioContext();
+    if (ctx.state === 'suspended') void ctx.resume();
+    return ctx;
+  };
+  const tone = (f:number,d=.07,g=.025,delay=0) => {
+    try {
+      const c = ensure(), o = c.createOscillator(), a = c.createGain(), t = c.currentTime + delay;
+      o.frequency.setValueAtTime(f,t); a.gain.setValueAtTime(g,t); a.gain.exponentialRampToValueAtTime(.0001,t+d);
+      o.connect(a).connect(c.destination); o.start(t); o.stop(t+d);
+    } catch {}
+  };
+  const unlock = () => { try { ensure(); } catch {} };
+  addEventListener('pointerdown', unlock, { once:true });
+  addEventListener('keydown', unlock, { once:true });
+  return {
+    pinch(){tone(640,.05,.02);tone(920,.06,.015,.04)},
+    blocked(){tone(230,.09,.03);tone(420,.1,.025,.08);tone(700,.12,.02,.16)},
+    clear(){tone(520,.08,.02);tone(760,.11,.018,.07)},
+  };
+}
+
+export class RoomshiftCompetitionPolishSystem extends createSystem({
+  allTargets:{required:[RayInteractable]},
+  hoveredTargets:{required:[RayInteractable,Hovered]},
+  pressedTargets:{required:[RayInteractable,Pressed]},
+}) {
+  private active=false;
+  private hud:HTMLElement|null=null;
+  private lastDecision='';
+  private decorated=new WeakSet<object>();
+  private toastTimer:number|null=null;
+  private audio=makeAudio();
+
+  init():void {
+    this.active = presentationMode();
+    if (!this.active) { console.info('[ROOMSHIFT W3A] OFF; use ?presentation=1'); return; }
+    this.hud = buildHud();
+    hideEngineeringPanels();
+    window.setInterval(hideEngineeringPanels, 600);
+    this.cleanupFuncs.push(this.queries.pressedTargets.subscribe('qualify',()=>this.audio.pinch()));
+    console.info('[ROOMSHIFT W3A] Competition presentation ACTIVE');
+  }
+
+  private decorate(entity:any) {
+    if (!this.active || this.decorated.has(entity)) return;
+    const id = normalizeTarget(entity);
+    const obj:THREE.Object3D|undefined = entity?.object3D;
+    if (!id || !obj) return;
+    const glow = makeGlow(accent(id));
+    glow.name = 'ROOMSHIFT_W3A_GLOW';
+    const label = makeLabel(targetNames[id] || id, accent(id));
+    label.name = 'ROOMSHIFT_W3A_LABEL';
+    obj.add(glow); obj.add(label);
+    obj.userData.roomshiftW3aGlow = glow;
+    obj.userData.roomshiftW3aLabel = label;
+    this.decorated.add(entity);
+  }
+
+  private feedback() {
+    for (const entity of this.queries.allTargets.entities) {
+      this.decorate(entity);
+      const obj:any = (entity as any)?.object3D;
+      if (!obj?.userData?.roomshiftW3aGlow) continue;
+      const h = this.queries.hoveredTargets.entities.has(entity);
+      const p = this.queries.pressedTargets.entities.has(entity);
+      const glow = obj.userData.roomshiftW3aGlow as THREE.Sprite;
+      const label = obj.userData.roomshiftW3aLabel as THREE.Sprite;
+      (glow.material as THREE.SpriteMaterial).opacity = p ? .95 : h ? .72 : .28;
+      const s = p ? 1.3 : h ? 1.14 : 1;
+      glow.scale.set(.34*s,.34*s,1);
+      label.scale.set(.42*(h?1.06:1),.105*(h?1.06:1),1);
+    }
+  }
+
+  private toast(big:string,small:string,blocked:boolean) {
+    if (!this.hud) return;
+    const t=this.hud.querySelector<HTMLElement>('#rs-toast');
+    const b=this.hud.querySelector<HTMLElement>('#rs-toast-big');
+    const s=this.hud.querySelector<HTMLElement>('#rs-toast-small');
+    if(!t||!b||!s)return;
+    b.textContent=big;s.textContent=small;t.style.borderColor=blocked?'#ffb020':'#00e5ff';t.classList.add('show');
+    if(this.toastTimer!==null)clearTimeout(this.toastTimer);
+    this.toastTimer=window.setTimeout(()=>t.classList.remove('show'),2200);
+  }
+
+  update():void {
+    if(!this.active||!source)return;
+    this.feedback();
+    const d=source.getDecision(), p=source.getPlan();
+    const de=this.hud?.querySelector<HTMLElement>('#rs-decision');
+    const pe=this.hud?.querySelector<HTMLElement>('#rs-plan');
+    if(de){de.textContent=d==='BLOCKED'?'ROUTE BLOCKED':d==='CLEAR'?'ROUTE CLEAR':'ANALYZING…';de.style.color=d==='BLOCKED'?'#ffb020':'#00e5ff'}
+    if(pe){pe.textContent=p==='DRONE_DIVERSION'?'PLAN B · DRONE DIVERSION':p==='LASER_BYPASS'?'PLAN A · LASER BYPASS':'Spatial route pending'}
+    if((d==='CLEAR'||d==='BLOCKED')&&this.lastDecision&&d!==this.lastDecision){
+      if(d==='BLOCKED'){this.audio.blocked();this.toast('ROOM CHANGED','Old route invalid · Replanning → DRONE DIVERSION',true)}
+      else{this.audio.clear();this.toast('ROUTE RESTORED','Spatial scan confirms LASER BYPASS',false)}
+    }
+    if(d==='CLEAR'||d==='BLOCKED')this.lastDecision=d;
+  }
+
+  destroy():void { this.hud?.remove(); this.hud=null; super.destroy(); }
+}
+
+export function installRoomshiftCompetitionPolish(world:World, s:PresentationSource):void {
+  source=s;
+  world.registerSystem(RoomshiftCompetitionPolishSystem,{priority:1000});
+}
